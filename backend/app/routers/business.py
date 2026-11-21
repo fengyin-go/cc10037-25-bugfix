@@ -7,7 +7,9 @@ from fastapi import APIRouter, HTTPException
 
 from app.engine.alert_matcher import AlertLevel, AlertRule
 from app.engine.backfill_plan import BackfillEngine
-from app.engine.validation_executor import CheckLevel, CheckType, QualityRule
+from app.engine.validation_executor import (
+    CheckLevel, CheckType, PartitionSample, QualityRule,
+)
 from app.engine.watermark_progress import WatermarkEngine, WatermarkRecord, WatermarkStatus
 from app.orchestrator import ETLOrchestrator
 
@@ -40,17 +42,8 @@ def orchestrate_pipeline(body: dict[str, Any]) -> dict[str, Any]:
 
 # ---- 质量门禁 ----
 
-@router.post("/quality/gate")
-def run_quality_gate(body: dict[str, Any]) -> dict[str, Any]:
-    """对管线数据执行质量门禁。
-
-    body:
-      pipeline_id, rules: [{"rule_id", "rule_name", "target_table", "check_field",
-                             "check_type", "threshold", "level", "extra": {}}],
-      sample_data: [dict]
-    """
-    pipeline_id = body["pipeline_id"]
-    rules = [
+def _parse_quality_rules(raw_rules: list[dict[str, Any]]) -> list[QualityRule]:
+    return [
         QualityRule(
             rule_id=r["rule_id"],
             rule_name=r["rule_name"],
@@ -61,16 +54,20 @@ def run_quality_gate(body: dict[str, Any]) -> dict[str, Any]:
             level=CheckLevel(r.get("level", "WARN")),
             extra=r.get("extra", {}),
         )
-        for r in body.get("rules", [])
+        for r in raw_rules
     ]
-    result = _orchestrator.run_quality_gate(
-        pipeline_id, rules, body.get("sample_data", []),
-    )
-    return {
+
+
+def _serialize_gate(result) -> dict[str, Any]:
+    payload = {
         "pipeline_id": result.pipeline_id,
         "overall_pass": result.overall_pass,
         "decision": result.decision,
         "failed_ratio": result.failed_ratio,
+        "samples_collected": result.samples_collected,
+        "genuine_empty": result.genuine_empty,
+        "total_sample_rows": result.total_sample_rows,
+        "total_bad_rows": result.total_bad_rows,
         "results": result.results,
         "triggered_alerts": [
             {"rule_id": a.rule_id, "rule_name": a.rule_name,
@@ -78,6 +75,60 @@ def run_quality_gate(body: dict[str, Any]) -> dict[str, Any]:
             for a in result.triggered_alerts
         ],
     }
+    if result.coverage is not None:
+        payload["coverage"] = result.coverage
+        payload["partition_results"] = result.partition_results
+        payload["pending_collection"] = result.pending_collection
+        payload["collection_failures"] = result.collection_failures
+    return payload
+
+
+@router.post("/quality/gate")
+def run_quality_gate(body: dict[str, Any]) -> dict[str, Any]:
+    """对管线数据执行质量门禁。
+
+    body:
+      pipeline_id, rules: [{"rule_id", "rule_name", "target_table", "check_field",
+                             "check_type", "threshold", "level", "extra": {}}],
+      sample_data: [dict]
+
+    缺失采集凭据的空样本（sample_data 为空）不再被当成零坏行通过：
+    返回 PENDING_COLLECTION，samples_collected=false，校验详情不补造样本行。
+    真实零行请走 /quality/partition-gate，以 COLLECTED + 空 rows 显式表达。
+    """
+    pipeline_id = body["pipeline_id"]
+    rules = _parse_quality_rules(body.get("rules", []))
+    result = _orchestrator.run_quality_gate(
+        pipeline_id, rules, body.get("sample_data", []),
+    )
+    return _serialize_gate(result)
+
+
+@router.post("/quality/partition-gate")
+def run_partition_quality_gate(body: dict[str, Any]) -> dict[str, Any]:
+    """分区质检门禁：先校验采集覆盖，再按实际到齐样本逐规则统计坏行。
+
+    body:
+      pipeline_id,
+      rules: [{"rule_id", "rule_name", "target_table", "check_field",
+               "check_type", "threshold", "level", "extra": {}}],
+      partitions: [
+        {"partition": "2026-11-19", "status": "COLLECTED",
+         "rows": [{"order_id": "o1"}, ...]},
+        {"partition": "2026-11-20", "status": "COLLECTED", "rows": []},  # 真实零行
+        {"partition": "2026-11-21", "status": "NOT_COLLECTED"},         # 尚未回报
+        {"partition": "2026-11-22", "status": "COLLECTION_FAILED",
+         "error_message": "采集凭据缺失"},
+      ]
+
+    采集恢复后用相同规则（原阈值）和实际到齐样本重新提交即可重试，
+    服务端不缓存也不补造任何缺失样本。
+    """
+    pipeline_id = body["pipeline_id"]
+    rules = _parse_quality_rules(body.get("rules", []))
+    partitions = [PartitionSample.from_payload(p) for p in body.get("partitions", [])]
+    result = _orchestrator.run_partition_quality_gate(pipeline_id, rules, partitions)
+    return _serialize_gate(result)
 
 
 # ---- 水位与回刷 ----

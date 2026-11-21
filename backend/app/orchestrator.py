@@ -27,7 +27,8 @@ from app.engine.schema_evolution import (
     SchemaEvolutionEngine,
 )
 from app.engine.validation_executor import (
-    CheckLevel, CheckType, QualityRule, ValidationEngine, ValidationResult,
+    CheckLevel, CheckType, CollectionStatus, PartitionSample, QualityRule,
+    ValidationEngine, ValidationResult,
 )
 from app.engine.watermark_progress import (
     WatermarkAdvanceResult, WatermarkEngine, WatermarkRecord, WatermarkStatus,
@@ -52,10 +53,18 @@ class QualityGateResponse:
     """质量门禁结果。"""
     pipeline_id: str
     overall_pass: bool
-    decision: str                     # RELEASE / BLOCKED
+    decision: str                     # RELEASE / BLOCKED / PENDING_COLLECTION
     failed_ratio: float
     results: list[dict[str, Any]]
     triggered_alerts: list[AlertResult]
+    samples_collected: bool = True
+    genuine_empty: bool = False
+    coverage: dict[str, Any] | None = None
+    partition_results: list[dict[str, Any]] = field(default_factory=list)
+    pending_collection: list[dict[str, Any]] = field(default_factory=list)
+    collection_failures: list[dict[str, Any]] = field(default_factory=list)
+    total_sample_rows: int = 0
+    total_bad_rows: int = 0
 
 
 @dataclass
@@ -195,37 +204,171 @@ class ETLOrchestrator:
 
     # ---- 质量门禁 ----
 
+    @staticmethod
+    def _detect_missing_credentials(sample_data: list[dict[str, Any]]) -> bool:
+        """识别入口收到的是否为缺失采集凭据的空样本。
+
+        没有任何样本行（空列表）视为采集凭据缺失/未采集：
+        真实零行会通过分区接口以 COLLECTED + 空 rows 显式表达，
+        不会走这个裸入口。
+        """
+        return len(sample_data) == 0
+
     def run_quality_gate(
         self,
         pipeline_id: str,
         rules: list[QualityRule],
         sample_data: list[dict[str, Any]],
     ) -> QualityGateResponse:
-        """执行管线质量门禁。"""
-        result = self.validation.run_pipeline_quality(rules, sample_data, pipeline_id)
-        overall_pass = result["overall_pass"]
-        failed_ratio = result["overall_failed_ratio"]
+        """执行管线质量门禁。
 
-        # 触发告警
-        alert_rules = [
-            AlertRule(
-                rule_id=f"qalert_{r.rule_id}",
-                rule_name=f"质量检查:{r.rule_name}",
+        裸入口收到空样本时按「采集凭据缺失」处理：没有有效质检结论，
+        门禁不通过（PENDING_COLLECTION），校验详情不补造样本行。
+        """
+        samples_collected = not self._detect_missing_credentials(sample_data)
+        result = self.validation.run_pipeline_quality(
+            rules, sample_data, pipeline_id,
+            samples_collected=samples_collected,
+        )
+
+        alerts: list[AlertResult] = []
+        if not samples_collected:
+            # 采集待恢复记录：与坏行告警分开，不伪造 failed_ratio
+            coverage_rule = AlertRule(
+                rule_id="qalert_collection_coverage",
+                rule_name="采集覆盖缺失告警",
                 monitor_target=pipeline_id,
-                condition=f"failed_ratio > {r.threshold}",
-                level=AlertLevel.WARN if r.level == CheckLevel.WARN else AlertLevel.CRITICAL,
+                condition="coverage_pct < 1",
+                level=AlertLevel.CRITICAL,
             )
-            for r in rules
-        ]
-        alerts = self.alert.match_batch(alert_rules, {"failed_ratio": failed_ratio})
+            alerts = self.alert.match_batch(
+                [coverage_rule],
+                {"coverage_pct": 0.0, "failed_ratio": 0.0},
+            )
+        else:
+            # 告警评估使用逐规则的实际覆盖与坏行统计，而不是被零行稀释的汇总值
+            alert_rules = [
+                AlertRule(
+                    rule_id=f"qalert_{r.rule_id}",
+                    rule_name=f"质量检查:{r.rule_name}",
+                    monitor_target=pipeline_id,
+                    condition=f"failed_ratio > {r.threshold}",
+                    level=AlertLevel.WARN if r.level == CheckLevel.WARN else AlertLevel.CRITICAL,
+                )
+                for r in rules
+            ]
+            for rule, summary in zip(rules, result["rule_results"]):
+                metrics = {
+                    "failed_ratio": summary["ratio"],
+                    "failed_rows": summary["failed"],
+                    "total_rows": summary["total"],
+                }
+                alerts.extend(self.alert.match_batch(
+                    [next(ar for ar in alert_rules if ar.rule_id == f"qalert_{rule.rule_id}")],
+                    metrics,
+                ))
 
         return QualityGateResponse(
             pipeline_id=pipeline_id,
-            overall_pass=overall_pass,
+            overall_pass=result["overall_pass"],
             decision=result["decision"],
-            failed_ratio=failed_ratio,
+            failed_ratio=result["overall_failed_ratio"],
             results=result["rule_results"],
             triggered_alerts=alerts,
+            samples_collected=result["samples_collected"],
+            genuine_empty=result["genuine_empty"],
+            total_sample_rows=sum(r["total"] for r in result["rule_results"]),
+            total_bad_rows=sum(r["failed"] for r in result["rule_results"]),
+        )
+
+    def run_partition_quality_gate(
+        self,
+        pipeline_id: str,
+        rules: list[QualityRule],
+        partitions: list[PartitionSample],
+    ) -> QualityGateResponse:
+        """分区质检门禁：先校验采集覆盖，再评估逐规则坏行与告警。
+
+        告警分两类，值班人员可据此区分「可立即处理的坏行」与「等待采集
+        恢复的分区」：
+
+        - 采集覆盖告警：coverage_pct < 1，携带未回报/失败分区清单；
+        - 坏行告警：按每条规则在实际到齐样本上的 failed_ratio 与原阈值评估，
+          只统计已确认为坏行的订单记录，真实零行不进入分母。
+        """
+        result = self.validation.run_partition_gate(rules, partitions, pipeline_id)
+        coverage = result["coverage"]
+        alerts: list[AlertResult] = []
+
+        # 1) 采集覆盖告警（待恢复记录，不是坏行）
+        if not coverage["coverage_complete"]:
+            coverage_rule = AlertRule(
+                rule_id="qalert_collection_coverage",
+                rule_name="采集覆盖缺失告警",
+                monitor_target=pipeline_id,
+                condition="coverage_pct < 1",
+                level=AlertLevel.CRITICAL,
+            )
+            coverage_alerts = self.alert.match_batch(
+                [coverage_rule],
+                {
+                    "coverage_pct": coverage["coverage_pct"],
+                    "failed_ratio": result["overall_failed_ratio"],
+                },
+            )
+            for alert in coverage_alerts:
+                if alert.matched:
+                    pending = (
+                        coverage["not_collected_partitions"]
+                        + coverage["collection_failed_partitions"]
+                    )
+                    alert.message = (
+                        f"{alert.message}\n待恢复分区: {', '.join(pending) or '无'}"
+                    )
+            alerts.extend(coverage_alerts)
+
+        # 2) 逐规则坏行告警：只用实际到齐样本的统计与规则原阈值
+        for summary in result["rule_results"]:
+            alert_rule = AlertRule(
+                rule_id=f"qalert_{summary['rule_id']}",
+                rule_name=f"质量检查:{summary['rule_name']}",
+                monitor_target=pipeline_id,
+                condition=f"failed_ratio > {summary['threshold']}",
+                level=AlertLevel.WARN if summary["level"] == "WARN" else AlertLevel.CRITICAL,
+            )
+            rule_alerts = self.alert.match_batch(
+                [alert_rule],
+                {
+                    "failed_ratio": summary["failed_ratio"],
+                    "failed_rows": summary["failed_rows"],
+                    "total_rows": summary["total_rows"],
+                },
+            )
+            for alert in rule_alerts:
+                if alert.matched and summary["bad_partitions"]:
+                    alert.message = (
+                        f"{alert.message}\n坏行分区: "
+                        f"{', '.join(summary['bad_partitions'])}"
+                    )
+            alerts.extend(rule_alerts)
+
+        return QualityGateResponse(
+            pipeline_id=pipeline_id,
+            overall_pass=result["overall_pass"],
+            decision=result["decision"],
+            failed_ratio=result["overall_failed_ratio"],
+            results=result["rule_results"],
+            triggered_alerts=alerts,
+            samples_collected=coverage["coverage_complete"],
+            genuine_empty=(
+                coverage["coverage_complete"] and result["total_sample_rows"] == 0
+            ),
+            coverage=coverage,
+            partition_results=result["partition_results"],
+            pending_collection=result["pending_collection"],
+            collection_failures=result["collection_failures"],
+            total_sample_rows=result["total_sample_rows"],
+            total_bad_rows=result["total_bad_rows"],
         )
 
     # ---- 水位与回刷 ----
